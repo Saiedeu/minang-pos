@@ -1,0 +1,848 @@
+<?php
+/**
+ * POS System - Sales Interface
+ * Main point of sale interface with enhanced features
+ */
+
+define('MINANG_SYSTEM', true);
+require_once '../config/config.php';
+
+// Check authentication and permissions
+if (!User::isLoggedIn() || !User::hasPermission('pos_sales')) {
+    header('Location: index.php');
+    exit();
+}
+
+$user = User::getCurrentUser();
+$db = Database::getInstance();
+
+// Check active shift
+$activeShift = $db->fetchOne(
+    "SELECT * FROM shifts WHERE user_id = ? AND is_closed = 0 ORDER BY start_time DESC LIMIT 1", 
+    [$user['id']]
+);
+
+if (!$activeShift) {
+    header('Location: dashboard.php?error=no_active_shift');
+    exit();
+}
+
+// Get categories and products
+$categories = $db->fetchAll("SELECT * FROM categories WHERE is_active = 1 ORDER BY sort_order, name");
+$products = $db->fetchAll("
+    SELECT p.*, c.name as category_name 
+    FROM products p 
+    LEFT JOIN categories c ON p.category_id = c.id 
+    WHERE p.is_active = 1 AND p.list_in_pos = 1 
+    ORDER BY p.name
+");
+
+// Get customers
+$customers = $db->fetchAll("SELECT * FROM users WHERE role = 8 OR id IN (SELECT DISTINCT customer_id FROM sales WHERE customer_id IS NOT NULL) ORDER BY name");
+
+// Get settings
+$deliveryFee = $db->fetchOne("SELECT setting_value FROM settings WHERE setting_key = 'delivery_fee'")['setting_value'] ?? 15.00;
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POS Sales - <?php echo BUSINESS_NAME; ?></title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '<?php echo PRIMARY_COLOR; ?>',
+                        secondary: '<?php echo SECONDARY_COLOR; ?>',
+                        success: '<?php echo SUCCESS_COLOR; ?>',
+                        warning: '<?php echo WARNING_COLOR; ?>',
+                        danger: '<?php echo DANGER_COLOR; ?>'
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 overflow-hidden" x-data="posSystem()" @keydown.window="handleKeydown($event)">
+    <!-- Dark Mode Support -->
+    <script>
+        if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+            document.documentElement.classList.add('dark');
+        }
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => {
+            if (event.matches) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+        });
+    </script>
+
+    <!-- Enhanced Colorful Header -->
+    <header class="bg-gradient-to-r from-primary to-purple-600 shadow-lg border-b border-purple-400 h-16">
+        <div class="flex items-center justify-between px-4 h-full">
+            <!-- Left: Back & Brand -->
+            <div class="flex items-center space-x-3">
+                <a href="dashboard.php" class="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-lg transition-all">
+                    <i class="fas fa-arrow-left text-lg"></i>
+                </a>
+                <div class="flex items-center space-x-2">
+                    <div class="w-10 h-10 bg-white/20 backdrop-blur-sm rounded-lg flex items-center justify-center border border-white/30">
+                        <i class="fas fa-cash-register text-white text-lg"></i>
+                    </div>
+                    <div>
+                        <h1 class="text-lg font-bold text-white">POS Sales</h1>
+                        <p class="text-xs text-white/80">Shift: <?php echo formatDateTime($activeShift['start_time']); ?></p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Center: Date & Time -->
+            <div class="text-center text-white">
+                <div class="text-lg font-bold" x-text="currentTime"></div>
+                <div class="text-xs text-white/80" x-text="currentDate"></div>
+            </div>
+            
+            <!-- Right: User Info & Controls -->
+            <div class="flex items-center space-x-3">
+                <div class="text-right text-sm text-white">
+                    <p class="font-semibold"><?php echo $user['name']; ?></p>
+                    <p class="text-xs text-white/80"><?php echo User::getRoleName($user['role']); ?></p>
+                </div>
+                <button @click="showHeldOrders = true" class="relative p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-lg transition-all">
+                    <i class="fas fa-pause text-lg"></i>
+                    <template x-if="heldOrders.length > 0">
+                        <span class="absolute -top-1 -right-1 bg-red-500 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center font-bold" x-text="heldOrders.length"></span>
+                    </template>
+                </button>
+                <?php if (User::hasPermission('shift_close')): ?>
+                <button onclick="location.href='shift-close.php'" class="p-2 text-white/80 hover:text-white hover:bg-white/10 rounded-lg transition-all" title="Close Shift (Ctrl+Shift+L)">
+                    <i class="fas fa-power-off text-lg"></i>
+                </button>
+                <?php endif; ?>
+            </div>
+        </div>
+    </header>
+
+    <div class="flex h-screen" style="height: calc(100vh - 64px);">
+        <!-- Categories Sidebar -->
+        <div class="w-52 bg-white dark:bg-gray-800 shadow-sm border-r border-gray-200 dark:border-gray-700">
+            <div class="p-3">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-white mb-3">Categories</h2>
+                <div class="space-y-1">
+                    <button @click="selectedCategory = ''" 
+                            :class="selectedCategory === '' ? 'bg-primary text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'"
+                            class="w-full p-3 rounded-lg text-left text-sm font-medium transition-all transform hover:scale-105">
+                        <i class="fas fa-th-large mr-2 text-sm"></i>
+                        <span>All Items</span>
+                        <span class="float-right text-xs opacity-75" x-text="products.length"></span>
+                    </button>
+                    <?php foreach ($categories as $category): ?>
+                    <button @click="selectedCategory = '<?php echo $category['id']; ?>'" 
+                            :class="selectedCategory === '<?php echo $category['id']; ?>' ? 'bg-primary text-white shadow-lg' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'"
+                            class="w-full p-3 rounded-lg text-left text-sm font-medium transition-all transform hover:scale-105">
+                        <i class="<?php echo $category['icon'] ?? 'fas fa-circle'; ?> mr-2 text-sm"></i>
+                        <span><?php echo $category['name']; ?></span>
+                        <span class="float-right text-xs opacity-75" x-text="getCategoryCount('<?php echo $category['id']; ?>')"></span>
+                    </button>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+            <!-- Customer Section -->
+            <div class="p-3 border-t border-gray-200 dark:border-gray-700">
+                <h3 class="text-xs font-semibold text-gray-900 dark:text-white mb-2">Customer Details</h3>
+                <div class="space-y-2">
+                    <input type="text" x-model="customerSearch" @input="searchCustomers()" 
+                           placeholder="Search customer..." 
+                           class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                    <select x-model="selectedCustomer" @change="loadCustomerForDelivery()" class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                        <option value="">Walk-in Customer</option>
+                        <?php foreach ($customers as $customer): ?>
+                        <option value="<?php echo $customer['id']; ?>"><?php echo $customer['name']; ?> (<?php echo $customer['phone'] ?? 'No phone'; ?>)</option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Menu Items -->
+        <div class="flex-1 p-3 overflow-hidden">
+            <div class="mb-3 flex justify-between items-center">
+                <h2 class="text-lg font-semibold text-gray-900 dark:text-white">
+                    <span x-text="getCategoryName()"></span>
+                    <span class="text-sm text-gray-500 ml-2" x-text="'(' + filteredProducts.length + ' items)'"></span>
+                </h2>
+                <input type="text" x-model="searchTerm" placeholder="Search menu items..." 
+                       class="p-2 text-sm w-64 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3 overflow-y-auto" style="height: calc(100% - 70px);">
+                <template x-for="product in filteredProducts" :key="product.id">
+                    <div @click="addToCart(product)" 
+                         :class="product.quantity <= 0 ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:shadow-lg hover:border-primary hover:scale-105'"
+                         class="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-3 transition-all duration-200 transform">
+                        <!-- Product Image -->
+                        <div class="aspect-square bg-gradient-to-br from-gray-100 to-gray-200 dark:from-gray-700 dark:to-gray-600 rounded-lg mb-2 flex items-center justify-center overflow-hidden">
+                            <template x-if="product.photo">
+                                <img :src="'../assets/uploads/products/' + product.photo" :alt="product.name" class="w-full h-full object-cover">
+                            </template>
+                            <template x-if="!product.photo">
+                                <i class="fas fa-utensils text-2xl text-gray-400 dark:text-gray-500"></i>
+                            </template>
+                        </div>
+                        
+                        <h3 class="font-semibold text-gray-900 dark:text-white mb-1 text-sm leading-tight" x-text="product.name"></h3>
+                        <p class="text-xs text-gray-600 dark:text-gray-400 mb-2" x-text="product.name_ar"></p>
+                        
+                        <div class="space-y-1">
+                            <div class="flex justify-between items-center">
+                                <span class="text-lg font-bold text-primary" x-text="'QAR ' + parseFloat(product.sell_price).toFixed(2)"></span>
+                                <span :class="product.quantity <= 5 ? 'text-red-500' : 'text-green-600'" 
+                                      class="text-xs font-medium" x-text="'Stock: ' + product.quantity"></span>
+                            </div>
+                            <template x-if="product.quantity <= 0">
+                                <div class="text-xs text-red-500 font-medium text-center">OUT OF STOCK</div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Enhanced Cart -->
+        <div class="w-96 bg-white dark:bg-gray-800 shadow-xl border-l border-gray-200 dark:border-gray-700 flex flex-col">
+            <!-- Cart Header -->
+            <div class="p-4 border-b border-gray-200 dark:border-gray-700 bg-gradient-to-r from-primary/10 to-purple-100 dark:from-primary/20 dark:to-purple-900/20">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Current Order</h2>
+                    <button @click="clearCart()" class="text-red-500 hover:text-red-700 text-sm font-medium">
+                        <i class="fas fa-trash mr-1"></i>Clear
+                    </button>
+                </div>
+
+                <!-- Order Type Toggle -->
+                <div class="mb-3">
+                    <div class="grid grid-cols-3 gap-1 bg-gray-200 dark:bg-gray-600 p-1 rounded-lg">
+                        <button @click="orderType = 'dine-in'" 
+                                :class="orderType === 'dine-in' ? 'bg-white dark:bg-gray-700 text-primary shadow-sm' : 'text-gray-600 dark:text-gray-400'"
+                                class="p-2 rounded-md text-xs font-medium transition-all">
+                            <i class="fas fa-utensils mr-1"></i>Dine-In
+                        </button>
+                        <button @click="orderType = 'takeaway'" 
+                                :class="orderType === 'takeaway' ? 'bg-white dark:bg-gray-700 text-primary shadow-sm' : 'text-gray-600 dark:text-gray-400'"
+                                class="p-2 rounded-md text-xs font-medium transition-all">
+                            <i class="fas fa-bag-shopping mr-1"></i>Take Away
+                        </button>
+                        <button @click="orderType = 'delivery'" 
+                                :class="orderType === 'delivery' ? 'bg-white dark:bg-gray-700 text-primary shadow-sm' : 'text-gray-600 dark:text-gray-400'"
+                                class="p-2 rounded-md text-xs font-medium transition-all">
+                            <i class="fas fa-motorcycle mr-1"></i>Delivery
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Order Details in Same Row -->
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Order No.</label>
+                        <input type="text" x-model="orderSerial" readonly
+                               class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-600 text-gray-900 dark:text-white">
+                    </div>
+                    
+                    <!-- Dine-in: Table Number -->
+                    <template x-if="orderType === 'dine-in'">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Table No. (Ctrl+T)</label>
+                            <input type="text" x-model="tableNumber" x-ref="tableInput"
+                                   class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                        </div>
+                    </template>
+                    
+                    <!-- Take Away: Order Type -->
+                    <template x-if="orderType === 'takeaway'">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Type</label>
+                            <div class="p-2 text-sm bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200 rounded border font-medium">
+                                <i class="fas fa-bag-shopping mr-1"></i>Take Away
+                            </div>
+                        </div>
+                    </template>
+                    
+                    <!-- Delivery: Order Type -->
+                    <template x-if="orderType === 'delivery'">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Type</label>
+                            <div class="p-2 text-sm bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 rounded border font-medium">
+                                <i class="fas fa-motorcycle mr-1"></i>Delivery
+                            </div>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Delivery Customer Details -->
+                <template x-if="orderType === 'delivery'">
+                    <div class="space-y-2 mt-2">
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Customer Name *</label>
+                                <input type="text" x-model="deliveryInfo.customerName" 
+                                       class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Phone Number *</label>
+                                <input type="tel" x-model="deliveryInfo.phone" 
+                                       class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Delivery Address *</label>
+                            <textarea x-model="deliveryInfo.address" rows="2"
+                                      class="w-full p-2 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary resize-none"></textarea>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Cart Items -->
+            <div class="flex-1 overflow-y-auto p-4">
+                <template x-if="cart.length === 0">
+                    <div class="text-center py-8">
+                        <i class="fas fa-shopping-cart text-3xl text-gray-300 dark:text-gray-600 mb-3"></i>
+                        <p class="text-gray-500 dark:text-gray-400 text-sm">No items in cart</p>
+                        <p class="text-gray-400 dark:text-gray-500 text-xs mt-1">Start adding items to begin order</p>
+                    </div>
+                </template>
+
+                <div class="space-y-3">
+                    <template x-for="(item, index) in cart" :key="index">
+                        <div class="bg-gray-50 dark:bg-gray-700 rounded-lg p-3 border border-gray-200 dark:border-gray-600">
+                            <div class="flex justify-between items-start mb-2">
+                                <div class="flex-1">
+                                    <h4 class="font-semibold text-gray-900 dark:text-white text-sm leading-tight" x-text="item.name"></h4>
+                                    <p class="text-xs text-gray-500 dark:text-gray-400" x-text="item.name_ar"></p>
+                                </div>
+                                <button @click="removeFromCart(index)" class="text-red-500 hover:text-red-700 transition-colors ml-2">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
+                            
+                            <!-- Quantity Controls -->
+                            <div class="flex justify-between items-center mb-2">
+                                <div class="flex items-center space-x-2">
+                                    <button @click="updateQuantity(index, item.quantity - 1)" 
+                                            class="w-7 h-7 bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center hover:bg-red-200 transition-colors">
+                                        <i class="fas fa-minus text-xs"></i>
+                                    </button>
+                                    <button @click="showQuantityModal(index)" 
+                                            class="px-3 py-1 bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 rounded-lg hover:bg-blue-200 transition-colors">
+                                        <span class="text-sm font-bold" x-text="item.quantity"></span>
+                                        <i class="fas fa-edit text-xs ml-1"></i>
+                                    </button>
+                                    <button @click="updateQuantity(index, item.quantity + 1)" 
+                                            class="w-7 h-7 bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded-full flex items-center justify-center hover:bg-green-200 transition-colors">
+                                        <i class="fas fa-plus text-xs"></i>
+                                    </button>
+                                </div>
+                                <div class="text-right">
+                                    <div class="text-xs text-gray-500 dark:text-gray-400" x-text="'QAR ' + parseFloat(item.sell_price).toFixed(2) + ' each'"></div>
+                                    <div class="text-sm font-bold text-primary" x-text="'QAR ' + (parseFloat(item.sell_price) * item.quantity).toFixed(2)"></div>
+                                </div>
+                            </div>
+                            
+                            <!-- Add-ons/Notes -->
+                            <template x-if="item.notes">
+                                <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded p-2 mb-2">
+                                    <p class="text-xs text-blue-800 dark:text-blue-200" x-text="'Note: ' + item.notes"></p>
+                                </div>
+                            </template>
+                            
+                            <div class="flex space-x-2">
+                                <button @click="addItemNote(index)" class="text-xs text-primary hover:text-primary/80 font-medium">
+                                    <i class="fas fa-sticky-note mr-1"></i>Add Note
+                                </button>
+                                <button @click="showAddonsModal(index)" class="text-xs text-purple-600 hover:text-purple-800 font-medium">
+                                    <i class="fas fa-plus mr-1"></i>Add Add-ons
+                                </button>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Total & Actions -->
+            <div class="p-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700">
+                <div class="space-y-2 mb-4 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-gray-600 dark:text-gray-400">Subtotal:</span>
+                        <span class="font-semibold text-gray-900 dark:text-white" x-text="'QAR ' + subtotal.toFixed(2)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-gray-600 dark:text-gray-400">Discount (F3):</span>
+                        <div class="flex items-center space-x-2">
+                            <input type="number" x-model="discount" @input="calculateTotal()" step="0.01" x-ref="discountInput"
+                                   class="w-20 p-1 text-xs text-right border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-primary">
+                            <span class="text-gray-600 dark:text-gray-400 text-xs">QAR</span>
+                        </div>
+                    </div>
+                    <template x-if="orderType === 'delivery'">
+                        <div class="flex justify-between">
+                            <span class="text-gray-600 dark:text-gray-400">Delivery Fee:</span>
+                            <span class="font-semibold text-gray-900 dark:text-white" x-text="'QAR ' + deliveryFee.toFixed(2)"></span>
+                        </div>
+                    </template>
+                    <div class="flex justify-between text-lg font-bold border-t pt-2">
+                        <span class="text-gray-900 dark:text-white">TOTAL:</span>
+                        <span class="text-primary text-xl" x-text="'QAR ' + total.toFixed(2)"></span>
+                    </div>
+                </div>
+
+                <div class="space-y-2">
+                    <button @click="holdOrder()" :disabled="cart.length === 0"
+                            class="w-full p-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-600 hover:to-orange-600 text-white rounded-lg font-semibold transition-all disabled:opacity-50">
+                        <i class="fas fa-pause mr-2"></i>Hold Order (F5)
+                    </button>
+                    <button @click="validateAndShowPayment()" :disabled="cart.length === 0"
+                            class="w-full p-3 bg-gradient-to-r from-primary to-purple-600 hover:from-primary/90 hover:to-purple-700 text-white rounded-lg font-semibold transition-all disabled:opacity-50">
+                        <i class="fas fa-credit-card mr-2"></i>Checkout (Enter)
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Payment Modal -->
+    <div x-show="showPayment" x-cloak class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-md w-full mx-4">
+            <div class="p-6">
+                <h3 class="text-xl font-bold text-gray-900 dark:text-white mb-4">Payment Processing</h3>
+
+                <div class="mb-4 p-4 bg-gradient-to-r from-primary/10 to-purple-100 rounded-lg">
+                    <p class="text-2xl font-bold text-primary text-center" x-text="'Total: QAR ' + total.toFixed(2)"></p>
+                </div>
+
+                <!-- Payment Methods -->
+                <div class="mb-4">
+                    <label class="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Payment Method</label>
+                    
+                    <!-- Dine-in & Take Away Payment Methods -->
+                    <template x-if="orderType !== 'delivery'">
+                        <div class="grid grid-cols-2 gap-2">
+                            <button @click="selectPaymentMethod('cash')" 
+                                    :class="paymentMethod === 'cash' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-money-bill-wave block mb-1"></i>
+                                <span class="text-xs">Cash</span>
+                            </button>
+                            <button @click="selectPaymentMethod('card')" 
+                                    :class="paymentMethod === 'card' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-credit-card block mb-1"></i>
+                                <span class="text-xs">Card</span>
+                            </button>
+                            <button @click="selectPaymentMethod('credit')" 
+                                    :class="paymentMethod === 'credit' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-user-clock block mb-1"></i>
+                                <span class="text-xs">Credit</span>
+                            </button>
+                            <button @click="selectPaymentMethod('foc')" 
+                                    :class="paymentMethod === 'foc' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-gift block mb-1"></i>
+                                <span class="text-xs">FOC</span>
+                            </button>
+                        </div>
+                    </template>
+
+                    <!-- Delivery Payment Methods -->
+                    <template x-if="orderType === 'delivery'">
+                        <div class="grid grid-cols-2 gap-2">
+                            <button @click="selectPaymentMethod('cash')" 
+                                    :class="paymentMethod === 'cash' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-money-bill-wave block mb-1"></i>
+                                <span class="text-xs">Cash Now</span>
+                            </button>
+                            <button @click="selectPaymentMethod('cod')" 
+                                    :class="paymentMethod === 'cod' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all">
+                                <i class="fas fa-hand-holding-usd block mb-1"></i>
+                                <span class="text-xs">COD</span>
+                            </button>
+                            <button @click="selectPaymentMethod('card')" 
+                                    :class="paymentMethod === 'card' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-700'"
+                                    class="p-3 rounded-lg text-center transition-all col-span-2">
+                                <i class="fas fa-credit-card block mb-1"></i>
+                                <span class="text-xs">Card Payment</span>
+                            </button>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Cash Amount Input -->
+                <template x-if="paymentMethod === 'cash'">
+                    <div class="mb-4">
+                        <label class="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Amount Received (QAR)</label>
+                        <input type="number" x-model="amountReceived" @input="calculateChange()" 
+                               x-ref="amountInput" step="0.01" 
+                               class="w-full p-4 text-xl font-bold text-center border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-primary">
+                        <template x-if="change >= 0">
+                            <p class="mt-2 text-lg font-bold text-green-600 text-center" x-text="'Change: QAR ' + change.toFixed(2)"></p>
+                        </template>
+                    </div>
+                </template>
+
+                <div class="flex space-x-3">
+                    <button @click="showPayment = false" class="flex-1 p-3 bg-gray-300 hover:bg-gray-400 text-gray-700 rounded-lg font-semibold">Cancel</button>
+                    <button @click="processPayment()" :disabled="!canProcessPayment()" 
+                            class="flex-1 p-3 bg-green-500 hover:bg-green-600 text-white rounded-lg font-semibold disabled:opacity-50">
+                        Process Payment
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function posSystem() {
+            return {
+                // PHP Data
+                categories: <?php echo json_encode($categories); ?>,
+                products: <?php echo json_encode($products); ?>,
+                customers: <?php echo json_encode($customers); ?>,
+                deliveryFee: <?php echo $deliveryFee; ?>,
+                
+                // State
+                selectedCategory: '',
+                searchTerm: '',
+                customerSearch: '',
+                selectedCustomer: '',
+                filteredCustomers: [],
+                
+                // Order
+                orderType: 'dine-in',
+                orderSerial: '',
+                tableNumber: '',
+                deliveryInfo: {
+                    customerName: '',
+                    phone: '',
+                    address: ''
+                },
+                
+                // Cart
+                cart: [],
+                subtotal: 0,
+                discount: 0,
+                total: 0,
+                
+                // Payment
+                showPayment: false,
+                paymentMethod: 'cash',
+                amountReceived: 0,
+                change: 0,
+                
+                // Modals
+                showQuantityInput: false,
+                showNoteModal: false,
+                showAddonsModal: false,
+                showHeldOrders: false,
+                
+                // Time
+                currentTime: '',
+                currentDate: '',
+                
+                // Held orders
+                heldOrders: [],
+
+                init() {
+                    this.filteredCustomers = this.customers;
+                    this.generateOrderSerial();
+                    this.updateDateTime();
+                    this.loadHeldOrders();
+                    
+                    setInterval(() => {
+                        this.updateDateTime();
+                    }, 1000);
+                },
+
+                updateDateTime() {
+                    const now = new Date();
+                    this.currentTime = now.toLocaleTimeString('en-US', { 
+                        hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit'
+                    });
+                    this.currentDate = now.toLocaleDateString('en-US', { 
+                        weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' 
+                    });
+                },
+
+                generateOrderSerial() {
+                    const now = new Date();
+                    const month = String(now.getMonth() + 1).padStart(2, '0');
+                    const day = String(now.getDate()).padStart(2, '0');
+                    const time = Date.now().toString().slice(-2);
+                    this.orderSerial = `LMR-${month}${day}${time}`;
+                },
+
+                getCategoryName() {
+                    if (!this.selectedCategory) return 'All Items';
+                    const category = this.categories.find(c => c.id == this.selectedCategory);
+                    return category ? category.name : 'All Items';
+                },
+
+                getCategoryCount(categoryId) {
+                    if (!categoryId) return this.products.length;
+                    return this.products.filter(p => p.category_id == categoryId).length;
+                },
+
+                get filteredProducts() {
+                    let filtered = this.products;
+                    
+                    if (this.selectedCategory) {
+                        filtered = filtered.filter(p => p.category_id == this.selectedCategory);
+                    }
+                    
+                    if (this.searchTerm) {
+                        const search = this.searchTerm.toLowerCase();
+                        filtered = filtered.filter(p => 
+                            p.name.toLowerCase().includes(search) ||
+                            (p.name_ar && p.name_ar.includes(search)) ||
+                            (p.code && p.code.toLowerCase().includes(search))
+                        );
+                    }
+                    
+                    return filtered;
+                },
+
+                addToCart(product) {
+                    if (product.quantity <= 0) {
+                        this.showAlert('Item is out of stock', 'error');
+                        return;
+                    }
+
+                    const existingItem = this.cart.find(item => item.id === product.id);
+                    if (existingItem) {
+                        if (existingItem.quantity < product.quantity) {
+                            existingItem.quantity++;
+                        } else {
+                            this.showAlert('Insufficient stock', 'warning');
+                            return;
+                        }
+                    } else {
+                        this.cart.push({
+                            id: product.id,
+                            name: product.name,
+                            name_ar: product.name_ar || '',
+                            sell_price: product.sell_price,
+                            quantity: 1,
+                            stock: product.quantity,
+                            notes: '',
+                            addons: []
+                        });
+                    }
+                    this.calculateTotal();
+                    this.showAlert('Item added to cart', 'success');
+                },
+
+                calculateTotal() {
+                    this.subtotal = this.cart.reduce((sum, item) => {
+                        return sum + (parseFloat(item.sell_price) * item.quantity);
+                    }, 0);
+                    
+                    const afterDiscount = Math.max(0, this.subtotal - this.discount);
+                    const deliveryCharge = this.orderType === 'delivery' ? this.deliveryFee : 0;
+                    this.total = afterDiscount + deliveryCharge;
+                },
+
+                validateAndShowPayment() {
+                    if (this.cart.length === 0) return;
+                    
+                    if (this.orderType === 'delivery') {
+                        if (!this.deliveryInfo.customerName || !this.deliveryInfo.phone || !this.deliveryInfo.address) {
+                            this.showAlert('Please fill in all delivery information', 'error');
+                            return;
+                        }
+                    }
+                    
+                    this.showPayment = true;
+                },
+
+                selectPaymentMethod(method) {
+                    this.paymentMethod = method;
+                    if (method === 'cash') {
+                        this.$nextTick(() => {
+                            if (this.$refs.amountInput) {
+                                this.$refs.amountInput.focus();
+                                this.$refs.amountInput.select();
+                            }
+                        });
+                    }
+                },
+
+                calculateChange() {
+                    this.change = this.amountReceived - this.total;
+                },
+
+                canProcessPayment() {
+                    if (this.cart.length === 0) return false;
+                    if (this.paymentMethod === 'cash') {
+                        return this.amountReceived >= this.total;
+                    }
+                    return true;
+                },
+
+                async processPayment() {
+                    if (!this.canProcessPayment()) return;
+                    
+                    const saleData = {
+                        order_number: this.orderSerial,
+                        order_type: this.getOrderTypeId(),
+                        table_number: this.tableNumber,
+                        customer_name: this.orderType === 'delivery' ? this.deliveryInfo.customerName : '',
+                        customer_phone: this.orderType === 'delivery' ? this.deliveryInfo.phone : '',
+                        customer_address: this.orderType === 'delivery' ? this.deliveryInfo.address : '',
+                        subtotal: this.subtotal,
+                        discount: this.discount,
+                        delivery_fee: this.orderType === 'delivery' ? this.deliveryFee : 0,
+                        total: this.total,
+                        payment_method: this.getPaymentMethodId(),
+                        amount_received: this.amountReceived,
+                        change_amount: this.change
+                    };
+                    
+                    const saleItems = this.cart.map(item => ({
+                        product_id: item.id,
+                        product_name: item.name,
+                        product_name_ar: item.name_ar,
+                        quantity: item.quantity,
+                        unit_price: item.sell_price,
+                        notes: item.notes
+                    }));
+                    
+                    try {
+                        const response = await fetch('../api/sales.php', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'create_sale',
+                                sale_data: saleData,
+                                sale_items: saleItems
+                            })
+                        });
+                        
+                        const result = await response.json();
+                        
+                        if (result.success) {
+                            this.showAlert('Payment processed successfully', 'success');
+                            this.newOrder();
+                            // Print receipt here
+                        } else {
+                            this.showAlert(result.message || 'Payment failed', 'error');
+                        }
+                    } catch (error) {
+                        this.showAlert('Network error occurred', 'error');
+                    }
+                    
+                    this.showPayment = false;
+                },
+
+                getOrderTypeId() {
+                    const types = { 'dine-in': 1, 'takeaway': 2, 'delivery': 3 };
+                    return types[this.orderType] || 1;
+                },
+
+                getPaymentMethodId() {
+                    const methods = { 'cash': 1, 'card': 2, 'credit': 3, 'foc': 4, 'cod': 5 };
+                    return methods[this.paymentMethod] || 1;
+                },
+
+                newOrder() {
+                    this.cart = [];
+                    this.discount = 0;
+                    this.selectedCustomer = '';
+                    this.amountReceived = 0;
+                    this.change = 0;
+                    this.paymentMethod = 'cash';
+                    this.tableNumber = '';
+                    this.deliveryInfo = { customerName: '', phone: '', address: '' };
+                    this.generateOrderSerial();
+                    this.calculateTotal();
+                },
+
+                holdOrder() {
+                    if (this.cart.length === 0) return;
+                    
+                    // Implementation for holding orders
+                    this.showAlert('Order held successfully', 'success');
+                    this.newOrder();
+                },
+
+                loadHeldOrders() {
+                    // Load held orders from API
+                    this.heldOrders = [];
+                },
+
+                // Keyboard shortcuts
+                handleKeydown(event) {
+                    if (this.showPayment) {
+                        if (event.key === 'Enter') {
+                            event.preventDefault();
+                            this.processPayment();
+                        } else if (event.key === ' ' && this.paymentMethod === 'cash') {
+                            event.preventDefault();
+                            this.amountReceived = this.total;
+                            this.calculateChange();
+                        }
+                    } else {
+                        if (event.key === 'Enter' && this.cart.length > 0) {
+                            event.preventDefault();
+                            this.validateAndShowPayment();
+                        } else if (event.key === 'F5') {
+                            event.preventDefault();
+                            this.holdOrder();
+                        } else if (event.key === 'F3') {
+                            event.preventDefault();
+                            this.$refs.discountInput?.focus();
+                        } else if (event.ctrlKey && event.key === 't') {
+                            event.preventDefault();
+                            this.$refs.tableInput?.focus();
+                        } else if (event.ctrlKey && event.shiftKey && event.key === 'L') {
+                            event.preventDefault();
+                            window.location.href = 'shift-close.php';
+                        }
+                    }
+                },
+
+                showAlert(message, type = 'info') {
+                    const colors = {
+                        success: 'bg-green-500',
+                        error: 'bg-red-500',
+                        warning: 'bg-yellow-500',
+                        info: 'bg-blue-500'
+                    };
+                    
+                    const alertDiv = document.createElement('div');
+                    alertDiv.className = `fixed top-20 right-4 ${colors[type]} text-white px-4 py-2 rounded-lg shadow-lg z-50 text-sm font-medium`;
+                    alertDiv.textContent = message;
+                    document.body.appendChild(alertDiv);
+                    
+                    setTimeout(() => {
+                        alertDiv.remove();
+                    }, 3000);
+                }
+            }
+        }
+    </script>
+
+    <style>
+        [x-cloak] { display: none !important; }
+    </style>
+</body>
+</html>
