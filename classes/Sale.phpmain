@@ -1,0 +1,350 @@
+<?php
+/**
+ * Sales Management Class
+ * Handles all sales operations and transactions
+ */
+
+if (!defined('MINANG_SYSTEM')) {
+    exit('Direct access not allowed');
+}
+
+class Sale {
+    private $db;
+
+    public function __construct() {
+        $this->db = Database::getInstance();
+    }
+
+    // Generate order number with LMR-MMDDSL format
+    public function generateOrderNumber() {
+        $date = date('md'); // MMDD format
+        
+        // Get today's order count
+        $today = date('Y-m-d');
+        $count = $this->db->fetchOne(
+            "SELECT COUNT(*) as count FROM sales WHERE DATE(created_at) = ?", 
+            [$today]
+        );
+        
+        $orderSerial = sprintf('%02d', ($count['count'] ?? 0) + 1);
+        return "LMR-{$date}{$orderSerial}";
+    }
+
+    // Generate receipt number
+    public function generateReceiptNumber() {
+        return 'R' . date('Ymd') . '-' . sprintf('%06d', mt_rand(100000, 999999));
+    }
+
+    // Create new sale
+    public function createSale($saleData, $saleItems) {
+        try {
+            $this->db->beginTransaction();
+            
+            // Generate numbers
+            $saleData['receipt_number'] = $this->generateReceiptNumber();
+            $saleData['order_number'] = $saleData['order_number'] ?? $this->generateOrderNumber();
+            $saleData['user_id'] = $_SESSION['user_id'];
+            $saleData['created_at'] = date('Y-m-d H:i:s');
+            
+            // Get active shift
+            $activeShift = $this->db->fetchOne(
+                "SELECT id FROM shifts WHERE user_id = ? AND is_closed = 0 ORDER BY start_time DESC LIMIT 1",
+                [$saleData['user_id']]
+            );
+            
+            if ($activeShift) {
+                $saleData['shift_id'] = $activeShift['id'];
+            }
+            
+            // Insert sale record
+            $saleId = $this->db->insert('sales', $saleData);
+            
+            if (!$saleId) {
+                throw new Exception('Failed to create sale record');
+            }
+            
+            // Insert sale items and update inventory
+            foreach ($saleItems as $item) {
+                $itemData = [
+                    'sale_id' => $saleId,
+                    'product_id' => $item['product_id'],
+                    'product_name' => $item['product_name'],
+                    'product_name_ar' => $item['product_name_ar'] ?? '',
+                    'quantity' => $item['quantity'],
+                    'unit_price' => $item['unit_price'],
+                    'total_price' => $item['quantity'] * $item['unit_price'],
+                    'notes' => $item['notes'] ?? ''
+                ];
+                
+                $itemId = $this->db->insert('sale_items', $itemData);
+                
+                if (!$itemId) {
+                    throw new Exception('Failed to create sale item');
+                }
+                
+                // Update product stock
+                $product = new Product();
+                if (!$product->reduceStock($item['product_id'], $item['quantity'])) {
+                    throw new Exception('Insufficient stock for product: ' . $item['product_name']);
+                }
+                
+                // Log stock movement
+                $product->logStockMovement(
+                    $item['product_id'], 
+                    'OUT', 
+                    'SALE', 
+                    $saleId, 
+                    $item['quantity'],
+                    'Sale transaction'
+                );
+            }
+            
+            // Update shift totals if shift is active
+            if ($activeShift) {
+                $this->updateShiftTotals($activeShift['id'], $saleData);
+            }
+            
+            $this->db->commit();
+            
+            return [
+                'success' => true, 
+                'sale_id' => $saleId,
+                'receipt_number' => $saleData['receipt_number'],
+                'order_number' => $saleData['order_number']
+            ];
+            
+        } catch (Exception $e) {
+            $this->db->rollback();
+            error_log("Sale creation error: " . $e->getMessage());
+            return ['success' => false, 'message' => $e->getMessage()];
+        }
+    }
+
+    // Update shift totals
+    private function updateShiftTotals($shiftId, $saleData) {
+        $paymentMethod = $saleData['payment_method'];
+        $amount = $saleData['total'];
+        $discount = $saleData['discount'] ?? 0;
+        
+        $updateFields = ['total_sales = total_sales + ?'];
+        $params = [$amount];
+        
+        // Update payment method totals
+        switch ($paymentMethod) {
+            case PAYMENT_CASH:
+                $updateFields[] = 'cash_sales = cash_sales + ?';
+                $params[] = $amount;
+                break;
+            case PAYMENT_CARD:
+                $updateFields[] = 'card_sales = card_sales + ?';
+                $params[] = $amount;
+                break;
+            case PAYMENT_CREDIT:
+                $updateFields[] = 'credit_sales = credit_sales + ?';
+                $params[] = $amount;
+                break;
+            case PAYMENT_FOC:
+                $updateFields[] = 'foc_sales = foc_sales + ?';
+                $params[] = $amount;
+                break;
+        }
+        
+        if ($discount > 0) {
+            $updateFields[] = 'discount_amount = discount_amount + ?';
+            $params[] = $discount;
+        }
+        
+        $params[] = $shiftId;
+        
+        $sql = "UPDATE shifts SET " . implode(', ', $updateFields) . " WHERE id = ?";
+        $this->db->query($sql, $params);
+    }
+
+    // Get sale by ID with items
+    public function getSaleById($id) {
+        // Get sale data
+        $sql = "SELECT s.*, u.name as cashier_name 
+                FROM sales s 
+                LEFT JOIN users u ON s.user_id = u.id 
+                WHERE s.id = ?";
+        
+        $sale = $this->db->fetchOne($sql, [$id]);
+        
+        if (!$sale) {
+            return null;
+        }
+        
+        // Get sale items
+        $sql = "SELECT si.*, p.code as product_code 
+                FROM sale_items si 
+                LEFT JOIN products p ON si.product_id = p.id 
+                WHERE si.sale_id = ?";
+        
+        $sale['items'] = $this->db->fetchAll($sql, [$id]);
+        
+        return $sale;
+    }
+
+    // Get sales by date range
+    public function getSalesByDateRange($startDate, $endDate, $userId = null) {
+        $where = "DATE(created_at) BETWEEN ? AND ?";
+        $params = [$startDate, $endDate];
+        
+        if ($userId) {
+            $where .= " AND user_id = ?";
+            $params[] = $userId;
+        }
+        
+        $sql = "SELECT s.*, u.name as cashier_name 
+                FROM sales s 
+                LEFT JOIN users u ON s.user_id = u.id 
+                WHERE {$where}
+                ORDER BY s.created_at DESC";
+        
+        return $this->db->fetchAll($sql, $params);
+    }
+
+    // Get today's sales
+    public function getTodaySales($userId = null) {
+        $today = date('Y-m-d');
+        return $this->getSalesByDateRange($today, $today, $userId);
+    }
+
+    // Hold order
+    public function holdOrder($orderData) {
+        $heldOrderData = [
+            'order_number' => $orderData['order_number'],
+            'user_id' => $_SESSION['user_id'],
+            'order_type' => $orderData['order_type'],
+            'table_number' => $orderData['table_number'] ?? null,
+            'customer_name' => $orderData['customer_name'] ?? null,
+            'customer_phone' => $orderData['customer_phone'] ?? null,
+            'customer_address' => $orderData['customer_address'] ?? null,
+            'subtotal' => $orderData['subtotal'],
+            'discount' => $orderData['discount'] ?? 0,
+            'total' => $orderData['total'],
+            'order_data' => json_encode($orderData['items']),
+            'held_at' => date('Y-m-d H:i:s')
+        ];
+        
+        $heldId = $this->db->insert('held_orders', $heldOrderData);
+        
+        return $heldId ? ['success' => true, 'held_id' => $heldId] : ['success' => false];
+    }
+
+    // Get held orders
+    public function getHeldOrders($userId = null) {
+        $where = $userId ? 'WHERE user_id = ?' : '';
+        $params = $userId ? [$userId] : [];
+        
+        $sql = "SELECT ho.*, u.name as user_name 
+                FROM held_orders ho
+                LEFT JOIN users u ON ho.user_id = u.id
+                {$where}
+                ORDER BY ho.held_at DESC";
+        
+        $heldOrders = $this->db->fetchAll($sql, $params);
+        
+        // Decode order data
+        foreach ($heldOrders as &$order) {
+            $order['items'] = json_decode($order['order_data'], true);
+        }
+        
+        return $heldOrders;
+    }
+
+    // Resume held order
+    public function resumeHeldOrder($heldId) {
+        $heldOrder = $this->db->fetchOne("SELECT * FROM held_orders WHERE id = ?", [$heldId]);
+        
+        if (!$heldOrder) {
+            return ['success' => false, 'message' => 'Held order not found'];
+        }
+        
+        // Delete held order
+        $deleted = $this->db->delete('held_orders', 'id = ?', [$heldId]);
+        
+        if ($deleted) {
+            $heldOrder['items'] = json_decode($heldOrder['order_data'], true);
+            return ['success' => true, 'order' => $heldOrder];
+        }
+        
+        return ['success' => false, 'message' => 'Failed to resume order'];
+    }
+
+    // Delete held order
+    public function deleteHeldOrder($heldId) {
+        return $this->db->delete('held_orders', 'id = ?', [$heldId]);
+    }
+
+    // Get sales statistics
+    public function getSalesStats($startDate = null, $endDate = null, $userId = null) {
+        $startDate = $startDate ?? date('Y-m-d');
+        $endDate = $endDate ?? date('Y-m-d');
+        
+        $where = "DATE(created_at) BETWEEN ? AND ?";
+        $params = [$startDate, $endDate];
+        
+        if ($userId) {
+            $where .= " AND user_id = ?";
+            $params[] = $userId;
+        }
+        
+        $sql = "SELECT 
+                    COUNT(*) as total_transactions,
+                    SUM(total) as total_amount,
+                    SUM(CASE WHEN payment_method = 1 THEN total ELSE 0 END) as cash_sales,
+                    SUM(CASE WHEN payment_method = 2 THEN total ELSE 0 END) as card_sales,
+                    SUM(CASE WHEN payment_method = 3 THEN total ELSE 0 END) as credit_sales,
+                    SUM(CASE WHEN payment_method = 4 THEN total ELSE 0 END) as foc_sales,
+                    SUM(CASE WHEN payment_method = 5 THEN total ELSE 0 END) as cod_sales,
+                    SUM(discount) as total_discounts,
+                    AVG(total) as average_transaction
+                FROM sales 
+                WHERE {$where}";
+        
+        return $this->db->fetchOne($sql, $params);
+    }
+
+    // Get best selling products
+    public function getBestSellingProducts($limit = 10, $startDate = null, $endDate = null) {
+        $startDate = $startDate ?? date('Y-m-d');
+        $endDate = $endDate ?? date('Y-m-d');
+        
+        $sql = "SELECT 
+                    si.product_name,
+                    si.product_name_ar,
+                    SUM(si.quantity) as total_quantity,
+                    SUM(si.total_price) as total_sales,
+                    COUNT(DISTINCT si.sale_id) as transaction_count
+                FROM sale_items si
+                INNER JOIN sales s ON si.sale_id = s.id
+                WHERE DATE(s.created_at) BETWEEN ? AND ?
+                GROUP BY si.product_id, si.product_name
+                ORDER BY total_quantity DESC
+                LIMIT ?";
+        
+        return $this->db->fetchAll($sql, [$startDate, $endDate, $limit]);
+    }
+
+    // Reprint receipt
+    public function reprintReceipt($receiptNumber) {
+        $sale = $this->db->fetchOne(
+            "SELECT * FROM sales WHERE receipt_number = ?", 
+            [$receiptNumber]
+        );
+        
+        if (!$sale) {
+            return null;
+        }
+        
+        // Get sale items
+        $sale['items'] = $this->db->fetchAll(
+            "SELECT * FROM sale_items WHERE sale_id = ?", 
+            [$sale['id']]
+        );
+        
+        return $sale;
+    }
+}
+?>

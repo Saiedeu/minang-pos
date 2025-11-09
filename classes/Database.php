@@ -1,0 +1,197 @@
+<?php
+/**
+ * Database Connection Class
+ * Handles all database operations using PDO
+ */
+
+if (!defined('MINANG_SYSTEM')) {
+    exit('Direct access not allowed');
+}
+
+class Database {
+    private static $instance = null;
+    private $connection;
+    private $host;
+    private $dbname;
+    private $username;
+    private $password;
+    private $charset;
+
+    private function __construct() {
+        $this->host = DB_HOST;
+        $this->dbname = DB_NAME;
+        $this->username = DB_USER;
+        $this->password = DB_PASS;
+        $this->charset = DB_CHARSET;
+        
+        $this->connect();
+    }
+
+    public static function getInstance() {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function connect() {
+        try {
+            $dsn = "mysql:host={$this->host};dbname={$this->dbname};charset={$this->charset}";
+            $options = [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES {$this->charset}"
+            ];
+            
+            $this->connection = new PDO($dsn, $this->username, $this->password, $options);
+        } catch (PDOException $e) {
+            die("Database connection failed: " . $e->getMessage());
+        }
+    }
+
+    public function getConnection() {
+        return $this->connection;
+    }
+
+    // Execute a query
+    public function query($sql, $params = []) {
+        try {
+            $stmt = $this->connection->prepare($sql);
+            $stmt->execute($params);
+            return $stmt;
+        } catch (PDOException $e) {
+            error_log("Database query error: " . $e->getMessage() . " | SQL: " . $sql . " | Params: " . print_r($params, true));
+            return false;
+        }
+    }
+
+    // Fetch single row
+    public function fetchOne($sql, $params = []) {
+        $stmt = $this->query($sql, $params);
+        return $stmt ? $stmt->fetch() : false;
+    }
+
+    // Fetch all rows
+    public function fetchAll($sql, $params = []) {
+        $stmt = $this->query($sql, $params);
+        return $stmt ? $stmt->fetchAll() : false;
+    }
+
+    // Insert data
+    public function insert($table, $data) {
+        $columns = implode(',', array_keys($data));
+        $placeholders = ':' . implode(', :', array_keys($data));
+        
+        $sql = "INSERT INTO {$table} ({$columns}) VALUES ({$placeholders})";
+        $stmt = $this->query($sql, $data);
+        
+        if ($stmt) {
+            return $this->connection->lastInsertId();
+        }
+        return false;
+    }
+
+    // Update data - FIXED VERSION
+    public function update($table, $data, $where, $whereParams = []) {
+        try {
+            $setClause = [];
+            $allParams = [];
+            
+            // Build SET clause with unique parameter names
+            $i = 0;
+            foreach ($data as $key => $value) {
+                $paramName = "set_param_{$i}";
+                $setClause[] = "{$key} = :{$paramName}";
+                $allParams[$paramName] = $value;
+                $i++;
+            }
+            $setClause = implode(', ', $setClause);
+            
+            // Convert WHERE clause to use named parameters
+            $whereProcessed = $where;
+            for ($j = 0; $j < count($whereParams); $j++) {
+                $whereParamName = "where_param_{$j}";
+                $whereProcessed = preg_replace('/\?/', ":{$whereParamName}", $whereProcessed, 1);
+                $allParams[$whereParamName] = $whereParams[$j];
+            }
+            
+            $sql = "UPDATE {$table} SET {$setClause} WHERE {$whereProcessed}";
+            
+            error_log("Update SQL: " . $sql);
+            error_log("Update Params: " . print_r($allParams, true));
+            
+            $stmt = $this->query($sql, $allParams);
+            $rowsAffected = $stmt ? $stmt->rowCount() : 0;
+            
+            error_log("Rows affected: " . $rowsAffected);
+            
+            return $rowsAffected;
+            
+        } catch (Exception $e) {
+            error_log("Database update error: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    // Delete data
+    public function delete($table, $where, $params = []) {
+        $sql = "DELETE FROM {$table} WHERE {$where}";
+        $stmt = $this->query($sql, $params);
+        return $stmt ? $stmt->rowCount() : false;
+    }
+
+    // Count records
+    public function count($table, $where = '1', $params = []) {
+        $sql = "SELECT COUNT(*) as count FROM {$table} WHERE {$where}";
+        $result = $this->fetchOne($sql, $params);
+        return $result ? $result['count'] : 0;
+    }
+
+    // Begin transaction
+    public function beginTransaction() {
+        return $this->connection->beginTransaction();
+    }
+
+    // Commit transaction
+    public function commit() {
+        return $this->connection->commit();
+    }
+
+    // Rollback transaction
+    public function rollback() {
+        return $this->connection->rollback();
+    }
+
+    // Check if table exists
+    public function tableExists($table) {
+        $sql = "SHOW TABLES LIKE ?";
+        $stmt = $this->query($sql, [$table]);
+        return $stmt && $stmt->rowCount() > 0;
+    }
+
+    // Get table schema
+    public function getTableSchema($table) {
+        $sql = "DESCRIBE {$table}";
+        return $this->fetchAll($sql);
+    }
+
+    // Execute raw SQL
+    public function execute($sql) {
+        try {
+            return $this->connection->exec($sql);
+        } catch (PDOException $e) {
+            error_log("Database execute error: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    // Prevent cloning
+    private function __clone() {}
+
+    // Prevent unserialization
+    public function __wakeup() {
+        throw new Exception("Cannot unserialize singleton");
+    }
+}
+?>
